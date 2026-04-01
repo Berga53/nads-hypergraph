@@ -10,7 +10,6 @@ def gip_function(x: np.ndarray, l: float, h: float) -> np.ndarray:
     return np.minimum(r, h)
 
 def influence_spread_step(
-    H: hnx.Hypergraph,
     I: np.ndarray,
     w: np.ndarray,
     x0: np.ndarray,
@@ -31,7 +30,6 @@ def influence_spread_step(
     return x_next
 
 def influence_spread(
-    H: hnx.Hypergraph,
     I: np.ndarray,
     w: np.ndarray,
     x0: np.ndarray,
@@ -42,18 +40,22 @@ def influence_spread(
     h0, l0, theta_l, theta_h, gamma, eps = params
     x = [x0]
     spread = [np.sum(x0)]
+    
+    alpha = np.mean(w)
 
     t = 1
 
     while np.linalg.norm(x[-1] * ((1 - gamma) ** t)) > eps and t <= max_t:
 
         l_t = ((theta_l * alpha) ** t) * l0
-        h_t = (theta_h * (theta_l ** (t - 1)) * (alpha**t)) * h0
-
-        x_next = influence_spread_step(H, I, w, x[-1], l_t, h_t)
+        h_t = (theta_h * (theta_l ** (t - 1)) * (alpha ** t)) * h0
+        
+        x_next = influence_spread_step(I, w, x[-1], l_t, h_t)
+        
         if np.all(x_next == x[-1]):
             break
         x.append(x_next)
         spread.append(spread[-1] + np.sum(x_next))
+        t += 1
 
     return spread[-1] ,spread, x
