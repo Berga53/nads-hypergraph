@@ -1,0 +1,7 @@
+hypernetx
+matplotlib
+networkx
+numpy
+openpyxl
+pandas
+jupyter

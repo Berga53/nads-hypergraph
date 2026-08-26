@@ -1,6 +1,5 @@
 # Python bytecode and caches
 __pycache__/
-__pycache__
 *.py[cod]
 *$py.class
 
@@ -33,3 +32,13 @@ Icon
 Icon?
 Thumbs.db
 .vscode/
+
+# Local source datasets and generated analysis data. The original network was
+# already versioned, so keep tracking it in its organized location.
+data/raw/*
+!data/raw/rete_IPL.dta
+data/processed/
+results/
+
+# Archived exploratory and superseded work
+misc/
