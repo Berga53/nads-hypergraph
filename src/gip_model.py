@@ -129,7 +129,9 @@ def gip(
         raise ValueError("alpha must be non-negative")
 
     states = [state.copy()]
-    spread_history = [float(objective_weights @ state)]
+    # Elementwise reduction avoids spurious BLAS floating-point warnings seen
+    # with dot products after sparse matrix operations on some NumPy builds.
+    spread_history = [float(np.sum(objective_weights * state))]
 
     for time_step in range(1, max_iter + 1):
         decayed_norm = np.linalg.norm(
@@ -160,7 +162,7 @@ def gip(
 
         states.append(next_state)
         spread_history.append(
-            spread_history[-1] + float(objective_weights @ next_state)
+            spread_history[-1] + float(np.sum(objective_weights * next_state))
         )
 
     return GIPResult(
