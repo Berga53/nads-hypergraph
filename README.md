@@ -8,6 +8,12 @@ optimizes the municipality seed set with NaDS.
 The NaDS implementation has no MG phase and no connectivity requirement on
 seed sets.
 
+The default and only supported evaluator uses a
+shared company gate, excludes direct self-return, and scores every state with
+population weights and discount `(1-gamma)^t`, including seeds at `t=0`.
+The active results folder contains only this model. Previous outputs are
+archived outside it under `misc/legacy_outputs/`. See [model and runner notes](MODEL_MIGRATION.md).
+
 ## Project layout
 
 ```text
@@ -16,8 +22,8 @@ data/
   processed/           generated clean networks and parameters
 notebooks/             interactive analysis
 results/
-  experiment/          one checkpointed results.csv experiment table
-scripts/               executable experiment runners
+  experiment/          current-model results.csv checkpoint
+scripts/               experiment runner
 src/                   preparation, GIP, and NaDS source modules
 ```
 
@@ -26,12 +32,11 @@ Core code:
 - `src/prepare_data.py` — creates clean yearly incidences and parameters;
 - `src/gip_model.py` — GIP diffusion and parameter alignment;
 - `src/nads.py` — fixed-budget NaDS seed search;
-- `scripts/run_yearly_influence_experiment.py` — comparable seed selection for
-  every year in one run;
-- `scripts/run_experiment.py` — configurable tempered alpha/seed-budget run
-  with one progressively saved CSV;
+- `scripts/run_experiment.py` — the sole experiment runner, with an alpha/seed-budget
+  grid across selected years and one progressively saved CSV;
 - `notebooks/graph_analysis.ipynb` — interactive longitudinal analysis;
-- `notebooks/influence_maximization.ipynb` — interactive single-year experiment.
+- `notebooks/influence_maximization.ipynb` — inspect saved propagation or call the runner interactively;
+- `notebooks/results.ipynb` — compare the current saved experiment results.
 
 The complete mathematical specification, modeling assumptions, hypergraph
 propagation equations, and NaDS search definition are in
@@ -94,93 +99,45 @@ Open `notebooks/graph_analysis.ipynb` and run it from the top. It compares graph
 hyperedge size, municipality degree, connected components, year-to-year
 turnover, and degree distributions. It also provides company and municipality
 rankings for a configurable year and reports parameter data quality.
+The detailed view defaults to the latest processed year. Structural summaries
+include singleton companies; experiment counts use the runner's company-size filter.
 
 ## 3. Run influence maximization
 
-Open `notebooks/influence_maximization.ipynb` and run it from the top. The notebook:
+Open `notebooks/influence_maximization.ipynb` and run it from the top. By default
+it reads the saved latest-year result with alpha 0.1 and seed budget 20, then
+reconstructs starting and optimized propagation. It shows selected municipalities,
+active and ever-reached counts, discounted score, stopping reason, and update count.
+Coverage includes seeds and uses the filtered experiment network as its denominator.
 
-1. builds the selected year's HyperNetX hypergraph;
-2. aligns one real company parameter with each incidence-matrix column and one
-   population weight with each row;
-3. defines population-weighted total GIP spread as the optimization objective;
-4. runs unrestricted fixed-budget NaDS exchanges;
-5. reports the selected municipalities and diffusion path.
+The notebook imports `ExperimentConfig` and `load_year_model` from
+`scripts/run_experiment.py`. Edit `CONFIG = replace(ExperimentConfig(), ...)`
+to choose another configuration. Defaults match the CLI: beta 0.5 for both
+weights, stress level 0, and horizon 20. `RUN_SEARCH = False` inspects a saved
+row matching all settings. `RUN_SEARCH = True` calls the runner's `run_year`
+search and displays the outcome in memory; the default allocation is 800 seconds.
+Use the CLI below to save checkpoints or run multiple settings.
 
-`D = 2` gives one-for-one exchanges. `D = 4` additionally permits two-for-two
-exchanges. `MAX_NEIGHBORS_PER_PHASE` and `SEARCH_SECONDS` control runtime.
+`CONFIG.d = 2` permits one-for-one exchanges; 4 also permits two-for-two exchanges.
+Set these frozen configuration fields through `replace`, including
+`max_neighbors_per_phase` and `search_seconds_per_year` to control search runtime.
+Population weights value states in the objective; they do not alter transmission
+or thresholds. Beta 1 uses full population differences, 0 gives equal valuation,
+and the weights are normalized to mean one on the filtered network.
 
-`NODE_WEIGHT_BETA = 1` uses full relative population differences, while `0`
-recovers the original equal-node objective. Node weights are normalized to mean
-one, so their scale stays comparable across years. They change how activated
-municipalities are valued in the objective; they do not alter GIP transmission
-or thresholds.
+## 4. Run the experiment
 
-## 4. Compare influence-central municipalities across all years
-
-Create/activate the local environment and run the complete experiment:
+Set up the environment if needed:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python scripts/run_yearly_influence_experiment.py
 ```
 
-The default run has a four-hour total NaDS budget. With the current 14 years
-and two profiles, this gives about 514 seconds to each of the 28 profile/year
-runs. Small post-search reporting overhead means actual elapsed time can be a
-little over four hours. If a NaDS search converges early, the runner restarts it
-with another reproducible neighborhood ordering and retains the best result.
-
-The two profiles provide a controlled sensitivity comparison:
-
-- `tempered` (primary): company-size and population exponents are both 0.5.
-  The square-root transform preserves empirical ordering but limits domination
-  by extreme values and reduces sensitivity to measurement/imputation noise.
-- `full`: both exponents are 1.0, so the complete relative differences in the
-  empirical variables enter the model. This tests whether the selections are
-  robust to stronger heterogeneity.
-
-Both profiles normalize node and edge weights to mean one and use the same
-graphs, GIP dynamics, 20-seed budget, deterministic degree-first initial set,
-and NaDS settings. The search uses one-for-one exchanges (`d=2`), evaluates up
-to 5,000 candidates per phase, and remembers 50,000 recent seed sets. Keeping
-the optimizer fixed makes profile differences attributable to model weighting,
-not unequal search effort.
-
-The shared GIP settings retain `h0=l0=1`, `theta_l=2`, `theta_h=50`, and
-`alpha=0.1`. They imply a lower path `0.2^t` and an upper path
-`5 * 0.2^(t-1)`, so the cap remains 25 times the activation floor at every
-step. `gamma=0.1` and `eps=0.01` provide a finite numerical horizon. The stress
-gate remains zero because ownership quotas span many orders of magnitude; a
-positive gate would need an externally justified unit-specific calibration.
-
-For a short smoke test, or to run only the primary profile:
-
-```bash
-python scripts/run_yearly_influence_experiment.py --years 2023 --search-seconds 30
-python scripts/run_yearly_influence_experiment.py --profiles tempered
-```
-
-Outputs under `results/yearly_influence/` are:
-
-- `year_summary.csv` — graph size, profile parameters, spread improvement,
-  restarts, objective calls, and runtime;
-- `selected_municipalities.csv` — the 20 chosen municipalities per profile and
-  year, ranked by individual population-weighted GIP spread;
-- `profile_comparison.csv` — within-year overlap and Jaccard similarity between
-  profile selections (spread columns use each profile's own objective);
-- `selection_turnover.csv` — retained/new/lost selections and consecutive-year
-  Jaccard similarity within each profile;
-- `selection_frequency.csv` — municipalities most consistently selected within
-  each profile over the complete period;
-- `experiment_config.json` — exact settings, profiles, and budget allocation.
-
-Here “central” means membership in the fixed-budget set that maximizes
-population-weighted cumulative GIP spread. Structural degree and ownership-
-weighted degree are included beside each selected municipality for comparison.
-
-## 5. Run the experiment
+`run_experiment.py` is the only experiment command. It contains its own
+configuration, data loading, per-year search, and checkpoint logic, and calls
+`src/gip_model.py` and `src/nads.py` directly.
 
 The experiment crosses:
 
@@ -194,6 +151,21 @@ It assigns a round 800 seconds to every scenario/year search:
 ```text
 3 alpha values × 3 budgets × 800 seconds = 2 search hours per year
 ```
+
+The tempered weights use square-root company-size and population differences,
+with both means equal to one. Initial seeds follow the existing degree-first
+rule. NaDS uses one-for-one exchanges, up to 5,000 candidates per phase, and
+restarts with reproducible neighbor orderings if time remains after convergence.
+
+The default GIP settings retain `h0=l0=1`, `theta_l=2`, `theta_h=50`, and
+`alpha=0.1`. They imply a lower path `0.2^t` and an upper path
+`5 * 0.2^(t-1)`, so the cap remains 25 times the activation floor at every
+step. The runner defaults to a fixed `--horizon 20`, with exactly 20 updates
+for every seed set. `gamma=0.1` discounts scores by `0.9^t`. Use
+`--early-stopping --max-iter 999` for numerical truncation with `eps=0.01`;
+this is not a certified bound on omitted score. The stress
+gate remains zero because ownership quotas span many orders of magnitude; a
+positive gate would need an externally justified unit-specific calibration.
 
 Run the latest available year with:
 
@@ -209,13 +181,15 @@ python scripts/run_experiment.py --years 2020
 python scripts/run_experiment.py --years 2018 2019 2020
 ```
 
-Every completed year/parameter combination is immediately checkpointed to the
-single file `results/experiment/results.csv`. Each row contains the year, every
-model and search parameter, `start_spread`, `finish_spread`, `start_list`, and
-`finish_list`. The two lists are JSON arrays of unique municipality IDs inside
-the CSV; the notebook joins them to readable municipality names. A matching
-year/parameter row is replaced rather than duplicated; when an interrupted
-command is started again, already saved combinations are skipped.
+Every completed year/parameter combination is immediately checkpointed to
+`results/experiment/results.csv`. Each row contains the year, model and search
+parameters, `start_spread`, `finish_spread`, `start_list`, `finish_list`, stopping
+reason, and actual diffusion updates. Seed lists are JSON arrays of unique
+municipality IDs; the notebook joins them to readable municipality names.
+Completed year/parameter instances are skipped on resume. Model version tags,
+input hashes, and score keys are not written to the CSV. After changing the
+processed input data, use a fresh output directory to avoid reusing old scores.
+
 For a short validation run:
 
 ```bash
@@ -224,11 +198,47 @@ python scripts/run_experiment.py \
   --output-dir /tmp/alpha_seed_smoke
 ```
 
-## 6. Inspect stored experiment results
+## 5. Inspect stored experiment results
 
-Open `notebooks/results.ipynb`. It reads `results.csv`, identifies which
+Open `notebooks/results.ipynb`. It reads `results/experiment/results.csv`, identifies which
 hyperparameters actually vary, checks the experiment grid, and compares spread
 levels, optimization gains, interactions, and optimized-set stability across
 alpha and seed budget. It also shows robust municipality selections and
 compares company propagation activity and ablation importance across alpha
 settings for a configurable year and seed budget.
+Reconstruction uses the shared runner loader and every saved propagation setting.
+Set `RESULT_FILTERS` when multiple horizons or other settings occur within a year,
+so alpha and seed-budget comparisons hold the remaining parameters fixed.
+
+
+## 6. Small example and automated verification
+
+```python
+import numpy as np
+from scipy.sparse import csr_matrix
+from src.gip_model import GIPParameters, gip, prepare_incidence
+
+B = prepare_incidence(csr_matrix([[1.0], [1.0]]))
+p = GIPParameters(h0=10, l0=0, theta_l=1, theta_h=1, gamma=0.5, eps=0.75)
+result = gip(B, np.array([1.0]), np.array([1.0, 0.0]), p,
+             node_weights=np.array([2.0, 3.0]), alpha=1, horizon=2)
+assert result.total_spread == 4.0  # 2 + 0.5*3 + 0.25*2
+assert result.iterations == 2
+```
+
+Use `horizon=0` to score seeds alone. With `horizon=None`, `max_iter` is the
+finite update cap; the norm test before step j uses exponent j-1. Equality
+never terminates evaluation. `prepare_incidence` holds a private sparse
+snapshot and cached elementwise square; prepare a new snapshot if B changes.
+SciPy is an explicit dependency. No diffusion-level normalization is performed.
+
+Run the automated synthetic suite (no empirical experiment):
+
+```bash
+MPLCONFIGDIR=/tmp/rete-ipl-mpl MPLBACKEND=Agg python -m unittest discover -s tests -v
+```
+
+It checks the explicit componentwise reference, graph reduction, discounting,
+seed contribution, gate semantics, stopping and bound indexing, fixed-horizon
+monotonicity, input validation, sparse storage, in-memory cache identity, checkpoint
+resume, and runner/notebook/NaDS integration on three synthetic nodes.

@@ -97,41 +97,40 @@ when none of them could activate it alone.
 
 ### 2.3 Company-to-municipality redistribution
 
-The transmitted hyperedge pressure is redistributed to all incident
-municipalities:
+The shared gate uses pressure from **all** shareholders, including the recipient.
+Only the returned contribution excludes the recipient's own old state. Set
+\(a^{(t)}=\kappa\odot g^{(t)}\) and let \(B^{\odot2}\) be the elementwise
+square of the incidence matrix. Then
 
 \[
-z^{(t+1)}=Br^{(t)}.
+d^{(t)}=B^{\odot2}a^{(t)},\qquad
+z^{(t+1)}=B(a^{(t)}\odot p^{(t)})-x^{(t)}\odot d^{(t)}.
 \]
 
-For municipality \(v\),
+The independent componentwise definition is
 
 \[
 z_v^{(t+1)}
 =\sum_{e\in E}B_{ve}\kappa_e g_e^{(t)}
-  \sum_{u\in V}B_{ue}x_u^{(t)}.
+  \sum_{u\ne v}B_{ue}x_u^{(t)}.
 \]
 
-Conditioned on company \(e\) being active, the one-step contribution from
-municipality \(u\) to municipality \(v\) through \(e\) is proportional to
+All terms use the same old state. There are no recipient-specific gates, no
+incidence deletion, and no diagonal modification of \(B\). For example,
+\(B=(1,1)^\top\), \(x=(1,1)\), \(\kappa=1\), \(\tau=1.5\) gives
+\(z=(1,1)\), even though each leave-one-out pressure is below the gate.
+The gate is strict: pressure equal to \(\tau\) does not activate a company.
 
-\[
-B_{ue}\kappa_e B_{ve}.
-\]
-
-Consequently, the same incidence structure is used twice:
-
-\[
-\text{municipalities}
-\xrightarrow{\,B^\top\,}
-\text{companies}
-\xrightarrow{\,B\,}
-\text{municipalities}.
-\]
-
-This two-stage map is the central graph-to-hypergraph generalization. It
-preserves the collective nature of a hyperedge instead of first replacing each
-company with an arbitrary collection of pairwise links.
+Production evaluation uses sparse matrix-vector products and caches
+`B.multiply(B)` in a private snapshot of an unchanged incidence matrix.
+It never constructs a dense municipality-by-municipality adjacency matrix.
+The raw result is mathematically nonnegative. Negative cancellation roundoff
+is set to zero only within a per-node tolerance of
+`8 * float64_eps * operation_count * max(abs(total), abs(own))`, plus eight
+smallest subnormal units. The operation count includes row and column
+reduction lengths. Material negatives and non-finite arithmetic raise errors.
+Ownership units, company parameters, and municipal weights are not normalized
+by the diffusion evaluator.
 
 ### 2.4 GIP threshold operator
 
@@ -169,41 +168,19 @@ x_v^{(t+1)}
 =T_{L_{t+1},U_{t+1}}\!\left(z_v^{(t+1)}\right).
 \]
 
-Equivalently, the entire propagation step is
-
-\[
-\boxed{
-x^{(t+1)}
-=
-T_{L_{t+1},U_{t+1}}
-\left(
-B\operatorname{diag}(\kappa)
-\left[
-(B^\top x^{(t)})
-\odot
-\mathbf 1\{B^\top x^{(t)}>\tau\}
-\right]
-\right),
-}
-\]
-
-where \(T\) is applied componentwise and \(\odot\) denotes the Hadamard
-product.
-
-Conditional on the active-hyperedge vector \(g^{(t)}\), the raw
-municipality-to-municipality operator is
+Equivalently, the update is \(x^{(t+1)}=T_{L_{t+1},U_{t+1}}(z^{(t+1)})\).
+For interpretation only, the conditional municipal operator is
 
 \[
 W_{\mathcal H}^{(t)}
-=B\operatorname{diag}(\kappa\odot g^{(t)})B^\top.
+=B\operatorname{diag}(a^{(t)})B^\top
+-\operatorname{diag}(B^{\odot2}a^{(t)}).
 \]
 
-If all pressured hyperedges are active, this reduces to
-
-\[
-W_{\mathcal H}
-=B\operatorname{diag}(\kappa)B^\top.
-\]
+Its diagonal is zero. If all pressured companies are active, replace
+\(a^{(t)}\) with \(\kappa\). Binary incidence columns with exactly two
+endpoints and \(\tau=0\) therefore reduce to ordinary GIP on the
+zero-diagonal weighted graph adjacency, with matching bounds and scoring.
 
 ## 3. Consequences of the hypergraph operator
 
@@ -218,8 +195,8 @@ insufficient.
 
 ### Broadcast within a hyperedge
 
-Once a company activates, its output reaches every municipality incident to
-that company in the same propagation step. A hyperedge therefore represents a
+Once a company activates, every incident municipality can receive influence
+from its other shareholders in the same propagation step. A hyperedge therefore represents a
 single many-to-many interaction, not a sequence of independent pairwise
 events.
 
@@ -228,18 +205,12 @@ events.
 If two municipalities share several companies, their contributions through
 those companies add. Hyperedge overlap can therefore amplify propagation.
 
-### Self-reinforcement
+### No direct self-return
 
-The diagonal of \(W_{\mathcal H}^{(t)}\) is generally positive:
-
-\[
-\left(W_{\mathcal H}^{(t)}\right)_{vv}
-=\sum_{e\ni v}\kappa_e g_e^{(t)}B_{ve}^2.
-\]
-
-Thus a municipality can reinforce its own state through companies in which it
-participates. This is part of the current propagation assumption, rather than
-an incidental graph self-loop.
+A company with one municipal owner returns zero influence. With two owners
+and only one active, only the other municipality receives the first return.
+A return through that other municipality on a later step is still permitted.
+Removing direct self-return changes neither the shared gate nor the incidences.
 
 ### Dependence on incidence units
 
@@ -263,40 +234,46 @@ absorbing.
 
 ## 4. Propagation horizon and stopping
 
-For theoretical analysis, propagation can be defined over a fixed finite
-horizon \(T\), or until a declared convergence/extinction condition is met.
-The implemented numerical stopping rule halts before step \(j\) when
+`gip(..., horizon=T)` performs exactly \(T\) updates and stores/scores \(T+1\)
+states, including \(T=0\). Tolerance and consecutive-state equality are ignored.
+Use the same fixed horizon for all candidate seed sets in theoretical comparisons.
+The experiment runner and active influence notebook default to \(T=20\);
+this is a declared finite horizon, not a claim that the omitted tail is negligible.
+
+With `horizon=None`, `max_iter` is a finite positive \(J_{\max}\). Before step
+\(j\ge1\), numerical early stopping tests
 
 \[
-\left\|(1-\gamma)^j x^{(j-1)}\right\|_2\le\varepsilon,
+\left\|(1-\gamma)^{j-1}x^{(j-1)}\right\|_2\le\varepsilon.
 \]
 
-and also halts at a maximum iteration count or when two consecutive states are
-exactly equal.
+Otherwise the evaluator computes and scores step \(j\), up to \(J_{\max}\)
+updates. Equality of two successive states is never a stopping rule: bounds
+may change later, and positive stationary states still contribute discounted
+value. Results report `stopping_reason` (`fixed_horizon`, `tolerance`, or
+`max_iter`) and `iterations` (actual updates).
 
-The parameter \(\gamma\) belongs to the stopping rule. It does not multiply the
-state used by the propagation recurrence. Therefore it should be interpreted
-as a horizon-control or numerical-decay parameter, not as physical attenuation
-along the municipality--company channel.
-
-Using a fixed horizon is usually cleaner for theoretical comparisons because
-every seed set is evaluated over the same number of propagation steps.
+The norm criterion is a numerical truncation, **not a proven bound on omitted
+objective value**. Its stopping time can depend on the seed set and on gamma.
+Fixed-horizon monotonicity must not automatically be claimed for these truncated
+scores. Gamma never attenuates the propagation state itself.
 
 ## 5. Generalized influence-maximization objective
 
 Let \(x^{(t)}(S)\) be the trajectory generated by seed set \(S\). For a fixed
-horizon \(T\), define population-weighted cumulative spread as
+horizon \(T\), define population-weighted, time-discounted cumulative spread with
+\(0<\gamma<1\) and discount \(1-\gamma\),
 
 \[
 F_T(S)
-=\sum_{t=0}^{T}\omega^\top x^{(t)}(S).
+=\sum_{t=0}^{T}(1-\gamma)^t\omega^\top x^{(t)}(S).
 \]
 
 With an endogenous stopping rule, the corresponding objective is
 
 \[
 F(S)
-=\sum_{t\in\mathcal T(S)}\omega^\top x^{(t)}(S),
+=\sum_{t\in\mathcal T(S)}(1-\gamma)^t\omega^\top x^{(t)}(S),
 \]
 
 where \(\mathcal T(S)\) is the stored trajectory of \(S\).
@@ -325,6 +302,15 @@ The objective makes three deliberate choices:
 
 The initial state \(t=0\) is included. Consequently, node weights affect both
 the direct value of choosing a seed and the value of its subsequent diffusion.
+The score starts at `dot(omega, x0)` and adds the discounted value after each
+update. Changing omega affects only scores; changing gamma also leaves any
+fixed-horizon trajectory unchanged. Neither is applied to B, pressure, or gates.
+
+Some propagation pseudocode in the graph paper accumulates only steps t >= 1;
+the mathematical graph IM objective includes t=0. With unit weights, common
+a0, and fixed budget b, omitting seeds subtracts the constant b*a0. With
+heterogeneous omega it subtracts a seed-dependent amount and can change rankings.
+All objectives and ablation baselines in this repository use t=0 exactly once.
 
 ## 6. Relation to classical influence maximization
 
@@ -335,14 +321,16 @@ four ways:
 - propagation is deterministic;
 - interactions are mediated by hyperedges;
 - activation is continuous and non-progressive;
-- spread is a weighted cumulative intensity.
+- spread is a weighted, time-discounted cumulative intensity.
 
 For a fixed horizon, the propagation map is coordinatewise nondecreasing when
 \(B,\kappa,\omega\) are nonnegative and \(U_t\ge L_t\). Indeed:
 
 - \(B^\top x\) is nondecreasing in \(x\);
-- \(p\mapsto p\mathbf 1\{p>\tau\}\) is nondecreasing;
-- multiplication by nonnegative matrices and weights preserves order;
+- each shared gate \(\mathbf 1\{p_e>\tau\}\) is nondecreasing;
+- each leave-one-out returned sum \(\sum_{u\ne v}B_{ue}x_u\) is nonnegative
+  and nondecreasing;
+- their product and the sum with nonnegative coefficients preserve order;
 - \(T_{L,U}\) is nondecreasing.
 
 It follows by induction that
@@ -515,8 +503,8 @@ The model rests on the following assumptions:
    retained.
 8. **Population as welfare weight.** Population changes valuation but not
    propagation.
-9. **Cumulative intensity as spread.** Repeated activation and activation
-   magnitude are intentionally counted.
+9. **Discounted cumulative intensity as spread.** Repeated activation and
+   activation magnitude are counted with time discount (1-gamma)^t, including seeds.
 10. **Homogeneous seed treatment.** Every selected municipality receives the
     same initial intensity unless the intervention model is explicitly
     extended.
@@ -526,5 +514,5 @@ The model rests on the following assumptions:
     channels of influence; the model alone does not establish causal effects.
 
 Under these assumptions, the object being optimized is best described as
-**population-weighted cumulative generalized influence on a weighted
-hypergraph**.
+**population-weighted, time-discounted cumulative generalized influence on a
+weighted hypergraph without direct self-return**.
