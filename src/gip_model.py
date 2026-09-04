@@ -1,4 +1,4 @@
-"""Shared-gate GIP without direct self-return, plus economic parameter loading."""
+"""Population-aware, shared-gate GIP with sparse active-frontier evaluation."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 from scipy import sparse
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED_DATA_DIR = PROJECT_ROOT / "data" / "processed"
@@ -32,54 +31,118 @@ def _vector(value: Any, name: str, size: int) -> np.ndarray:
     return array
 
 
+def _node_parameter(value: Any, name: str, size: int | None = None) -> np.ndarray:
+    array = np.asarray(value, dtype=float)
+    if array.ndim > 1 or (size is not None and array.ndim == 1 and array.shape != (size,)):
+        raise ValueError(f"{name} must be scalar or have shape ({size},)")
+    if not np.isfinite(array).all() or np.any(array < 0):
+        raise ValueError(f"{name} must be finite and non-negative")
+    return array if size is None else np.broadcast_to(array, (size,))
+
+
 def _update_count(value: int, name: str, minimum: int) -> int:
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
     return int(value)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class GIPParameters:
-    """Bounds, time discount (0 < gamma < 1), and numerical tolerance."""
+    """Node-wise bounds (scalars broadcast); historical h0 is exactly thesis u0.
 
-    h0: float
-    l0: float
-    theta_l: float
-    theta_h: float
+    Either h0 or u0 may be supplied, never both. theta_l/theta_h correspond to
+    theta_L/theta_H. There is no independent seed intensity a0.
+    """
+
+    h0: Any
+    l0: Any
+    theta_l: Any
+    theta_h: Any
     gamma: float
     eps: float
 
-    def validate(self) -> None:
-        for name in ("h0", "l0", "theta_l", "theta_h", "eps"):
-            _nonnegative_scalar(getattr(self, name), name)
+    def __init__(self, h0=None, l0=1.0, theta_l=2.0, theta_h=50.0,
+                 gamma=0.1, eps=0.01, *, u0=None):
+        if h0 is not None and u0 is not None:
+            raise ValueError("h0 is an alias of u0; supply only one")
+        values = dict(h0=1.0 if h0 is None and u0 is None else (u0 if h0 is None else h0),
+                      l0=l0, theta_l=theta_l, theta_h=theta_h, gamma=gamma, eps=eps)
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+
+    @property
+    def u0(self):
+        return self.h0
+
+    def validate(self, size: int | None = None, alpha: float | None = None) -> None:
+        lower, upper, theta_l, theta_h = [
+            _node_parameter(getattr(self, name), name, size)
+            for name in ("l0", "h0", "theta_l", "theta_h")
+        ]
+        try:
+            lower, upper, theta_l, theta_h = np.broadcast_arrays(lower, upper, theta_l, theta_h)
+        except ValueError as error:
+            raise ValueError("Node-wise GIP parameters must have compatible shapes") from error
+        if np.any(lower <= 0) or np.any(lower > upper):
+            raise ValueError("Require 0 < l0 <= u0 (historical h0)")
+        with np.errstate(over="raise", invalid="raise"):
+            if np.any(theta_h * upper < theta_l * lower):
+                raise ValueError("Require theta_h * u0 >= theta_l * l0")
+            if alpha is not None:
+                alpha = _nonnegative_scalar(alpha, "alpha")
+                if np.any(theta_l * alpha >= 1):
+                    raise ValueError("Require theta_l * alpha < 1 for decaying caps")
         if np.ndim(self.gamma) != 0 or not np.isfinite(self.gamma) or not 0 < self.gamma < 1:
             raise ValueError("gamma must be in (0, 1)")
+        if _nonnegative_scalar(self.eps, "eps") <= 0:
+            raise ValueError("eps must be positive")
+
+
+class IncompleteEvaluationError(RuntimeError):
+    """An operational cutoff cannot be used as a converged optimization score."""
 
 
 @dataclass
 class GIPResult:
-    """States and cumulative discounted scores, both including t=0."""
+    """Numerical prefix of the infinite sum, including t=0 exactly once."""
 
     total_spread: float
     spread_history: list[float]
     states: list[np.ndarray]
-    stopping_reason: str = "unspecified"
-    horizon: int | None = None
-    max_iter: int = 999
+    stopping_reason: str
+    max_iter: int | None = None
 
     @property
     def iterations(self) -> int:
         return len(self.states) - 1
 
+    @property
+    def steps(self) -> int:
+        return self.iterations
+
+    @property
+    def score(self) -> float:
+        return self.total_spread
+
+    @property
+    def final_state(self) -> np.ndarray:
+        return self.states[-1]
+
+    @property
+    def status(self) -> str:
+        return self.stopping_reason
+
+    def require_complete(self) -> GIPResult:
+        if self.status != "tolerance_reached":
+            raise IncompleteEvaluationError(
+                f"Incomplete GIP evaluation: {self.status} after {self.steps} updates "
+                f"(max_iter={self.max_iter}); increase/remove the operational guard"
+            )
+        return self
+
 
 def _nonnegative_difference(total: np.ndarray, own: np.ndarray, operations: Any) -> np.ndarray:
-    """Only erase cancellation roundoff, using a local floating-point scale.
-
-    Eight times the operation-count error scale allows for the two sparse
-    reductions and products. There is no arbitrary absolute clipping floor.
-    A materially negative result indicates invalid arithmetic or an implementation
-    error and must never be interpreted as zero influence.
-    """
+    """Erase only cancellation within eight operation-count-scaled error units."""
     if not np.isfinite(total).all() or not np.isfinite(own).all():
         raise FloatingPointError("Non-finite influence before self-return subtraction")
     raw = total - own
@@ -92,10 +155,10 @@ def _nonnegative_difference(total: np.ndarray, own: np.ndarray, operations: Any)
 
 
 class PreparedIncidence:
-    """Validated private CSR snapshot; reuse its elementwise square across runs.
+    """Private sparse snapshot, incident/owner lists, and lazy co-incidence lists.
 
-    Changes to the original B cannot invalidate this snapshot. Construct a new
-    instance after changing B. No municipality-by-municipality matrix is built.
+    Reuse across seed evaluations. No n-by-n matrix is built. The neighbors/nodes
+    interface also supplies NaDS's co-incidence ordering without a graph expansion.
     """
 
     def __init__(self, incidence: Any):
@@ -118,158 +181,251 @@ class PreparedIncidence:
         if not np.isfinite(matrix.data).all():
             raise ValueError("Summed incidence values must be finite")
         self._matrix = matrix
-        # SciPy ** 2 is a matrix power for sparse matrices: never use it here.
-        self._squared = matrix.multiply(matrix).tocsr()
+        self._squared = matrix.multiply(matrix).tocsr()  # Elementwise, never B ** 2.
+        self._columns = matrix.tocsc()
         if not np.isfinite(self._squared.data).all():
             raise FloatingPointError("Elementwise incidence square overflowed")
-        row_counts = np.diff(matrix.indptr)
-        col_counts = np.bincount(matrix.indices, minlength=matrix.shape[1])
-        self._operations = row_counts + col_counts.max(initial=0) + 4
+        col_counts = np.diff(self._columns.indptr)
+        self._operations = np.diff(matrix.indptr) + col_counts.max(initial=0) + 4
         self._edge_operations = 2 * col_counts + 4
-        for stored in (self._matrix, self._squared):
+        for stored in (self._matrix, self._squared, self._columns):
             for array in (stored.data, stored.indices, stored.indptr):
                 array.flags.writeable = False
+        self.incident_companies = tuple(matrix.indices[matrix.indptr[i]:matrix.indptr[i+1]]
+                                        for i in range(matrix.shape[0]))
+        self.owners = tuple(self._columns.indices[self._columns.indptr[e]:self._columns.indptr[e+1]]
+                            for e in range(matrix.shape[1]))
+        self._neighbors: dict[int, tuple[int, ...]] = {}
+        self.nodes = range(matrix.shape[0])
 
     @property
     def shape(self) -> tuple[int, int]:
         return self._matrix.shape
 
-    def _pressure(self, weights: np.ndarray, state: np.ndarray, stress: float):
-        pressure = np.asarray(self._matrix.T @ state).reshape(-1)
-        if not np.isfinite(pressure).all():
-            raise FloatingPointError("Non-finite company pressure")
-        # The strict shared gate sees ALL owners and is evaluated before kappa.
-        active_weights = weights * (pressure > stress)
-        return pressure, active_weights
+    def neighbors(self, node: int) -> tuple[int, ...]:
+        if node not in self.nodes:
+            raise IndexError("Invalid municipality index")
+        if node not in self._neighbors:
+            others = {int(i) for e in self.incident_companies[node] for i in self.owners[e]}
+            others.discard(node)
+            self._neighbors[node] = tuple(sorted(others))
+        return self._neighbors[node]
 
-    def _raw(self, weights: np.ndarray, state: np.ndarray, stress: float) -> np.ndarray:
-        pressure, active_weights = self._pressure(weights, state, stress)
+    def candidates(self, active) -> tuple[int, ...]:
+        return tuple(sorted({j for i in active for j in self.neighbors(int(i))}))
+
+    def _pressure(self, weights, state, omega, stress):
+        source = omega * state
+        pressure = np.asarray(self._matrix.T @ source).reshape(-1)
+        if not np.isfinite(source).all() or not np.isfinite(pressure).all():
+            raise FloatingPointError("Non-finite company pressure")
+        return source, pressure, weights * (pressure > stress)
+
+    def _raw_incidence(self, weights, state, omega, stress):
+        source, pressure, active_weights = self._pressure(weights, state, omega, stress)
         total = np.asarray(self._matrix @ (active_weights * pressure)).reshape(-1)
-        own = state * np.asarray(self._squared @ active_weights).reshape(-1)
+        own = source * np.asarray(self._squared @ active_weights).reshape(-1)
         return _nonnegative_difference(total, own, self._operations)
+
+    def _raw_frontier(self, weights, state, omega, stress, active, candidates):
+        # Fresh maps ensure companies outside E_active are closed each step.
+        source = omega * state
+        if not np.isfinite(source).all():
+            raise FloatingPointError("Non-finite population-weighted source")
+        pressure: dict[int, float] = {}
+        for i in active:
+            start, end = self._matrix.indptr[i:i+2]
+            for e, share in zip(self._matrix.indices[start:end], self._matrix.data[start:end]):
+                pressure[e] = pressure.get(e, 0.0) + share * source[i]
+        if not all(np.isfinite(p) for p in pressure.values()):
+            raise FloatingPointError("Non-finite company pressure")
+        gates = {e for e, p in pressure.items() if p > stress}
+        raw = np.zeros(self.shape[0])
+        for j in candidates:
+            start, end = self._matrix.indptr[j:j+2]
+            indices = self._matrix.indices[start:end]
+            shares = self._matrix.data[start:end]
+            mask = np.fromiter((e in gates for e in indices), dtype=bool, count=len(indices))
+            edges, shares = indices[mask], shares[mask]
+            if not len(edges):
+                continue
+            other = _nonnegative_difference(
+                np.array([pressure[e] for e in edges]), shares * source[j],
+                self._edge_operations[edges],
+            )
+            raw[j] = np.sum(shares * weights[edges] * other)
+        if not np.isfinite(raw).all():
+            raise FloatingPointError("Non-finite raw influence")
+        return raw
 
 
 def prepare_incidence(incidence: Any) -> PreparedIncidence:
     return incidence if isinstance(incidence, PreparedIncidence) else PreparedIncidence(incidence)
 
 
-def gip_thresholds(values: np.ndarray, lower: float, upper: float) -> np.ndarray:
-    """Remove influence strictly below L and cap influence strictly above U."""
-    lower = _nonnegative_scalar(lower, "lower")
-    upper = _nonnegative_scalar(upper, "upper")
-    if upper < lower:
-        raise ValueError("The upper GIP threshold cannot be below the lower threshold")
+def gip_thresholds(values, lower, upper) -> np.ndarray:
+    """Componentwise: zero below lower, otherwise cap at upper; equality passes."""
     values = np.asarray(values, dtype=float)
-    if not np.isfinite(values).all() or np.any(values < 0):
-        raise ValueError("Threshold inputs must be finite and non-negative")
+    if values.ndim != 1 or not np.isfinite(values).all() or np.any(values < 0):
+        raise ValueError("Threshold inputs must be a finite non-negative vector")
+    lower = _node_parameter(lower, "lower", len(values))
+    upper = _node_parameter(upper, "upper", len(values))
+    if np.any(upper < lower):
+        raise ValueError("The upper GIP threshold cannot be below the lower threshold")
     return np.minimum(np.where(values >= lower, values, 0.0), upper)
 
 
-def gip_raw_step(incidence: Any, edge_weights: np.ndarray, state: np.ndarray,
-                 stress_level: float = 0.0) -> np.ndarray:
-    """Raw shared-gate return, excluding only the recipient's own contribution."""
+def _step_inputs(incidence, edge_weights, state, node_weights, stress_level):
     network = prepare_incidence(incidence)
     weights = _vector(edge_weights, "edge_weights", network.shape[1])
     state = _vector(state, "state", network.shape[0])
+    omega = np.ones_like(state) if node_weights is None else _vector(node_weights, "node_weights", len(state))
     stress = _nonnegative_scalar(stress_level, "stress_level")
-    return network._raw(weights, state, stress)
+    return network, weights, state, omega, stress
 
 
-def gip_step(incidence: Any, edge_weights: np.ndarray, state: np.ndarray,
-             lower: float, upper: float, stress_level: float = 0.0) -> np.ndarray:
-    """One synchronous update, using the old state for all terms."""
-    return gip_thresholds(gip_raw_step(incidence, edge_weights, state, stress_level), lower, upper)
+def gip_raw_step(incidence, edge_weights, state, stress_level=0.0, *, node_weights=None):
+    """Production incoming influence, restricted to the active co-incidence frontier."""
+    network, weights, state, omega, stress = _step_inputs(incidence, edge_weights, state, node_weights, stress_level)
+    active = np.flatnonzero(state > 0)
+    return network._raw_frontier(weights, state, omega, stress, active, network.candidates(active))
 
 
-def company_activity(incidence: Any, edge_weights: np.ndarray, state: np.ndarray,
-                     stress_level: float = 0.0) -> np.ndarray:
-    """Per-company total raw return to OTHER owners, before municipal bounds.
+def gip_incidence_raw_step(incidence, edge_weights, state, stress_level=0.0, *, node_weights=None):
+    """Sparse full-incidence reference: B@(a*p) - (omega*q)*(B.multiply(B)@a)."""
+    args = _step_inputs(incidence, edge_weights, state, node_weights, stress_level)
+    network, weights, state, omega, stress = args
+    return network._raw_incidence(weights, state, omega, stress)
 
-    This diagnostic is unvalued and undiscounted; callers can time-discount it.
-    Its sum equals the sum of gip_raw_step, up to roundoff.
+
+def gip_source_raw_step(incidence, edge_weights, state, stress_level=0.0, *, node_weights=None):
+    """Independent small-case source-neighbor sum, without diagonal subtraction.
+
+    Gates are shared by all recipients. This slow reference never constructs W_H.
+    Its first weight index is the source: raw = W_H.T @ q.
     """
-    network = prepare_incidence(incidence)
-    weights = _vector(edge_weights, "edge_weights", network.shape[1])
-    state = _vector(state, "state", network.shape[0])
-    stress = _nonnegative_scalar(stress_level, "stress_level")
-    pressure, active_weights = network._pressure(weights, state, stress)
+    network, weights, state, omega, stress = _step_inputs(incidence, edge_weights, state, node_weights, stress_level)
+    source, pressure, active_weights = network._pressure(weights, state, omega, stress)
+    raw = np.zeros(network.shape[0])
+    for i in np.flatnonzero(state > 0):
+        for j in network.neighbors(int(i)):
+            shared = set(network.incident_companies[i]).intersection(network.incident_companies[j])
+            raw[j] += source[i] * sum(
+                network._matrix[i, e] * active_weights[e] * network._matrix[j, e] for e in shared
+            )
+    if not np.isfinite(raw).all():
+        raise FloatingPointError("Non-finite source-neighbor influence")
+    return raw
+
+
+def gip_step(incidence, edge_weights, state, lower, upper, stress_level=0.0, *, node_weights=None):
+    """One synchronous update; all inputs use the old state."""
+    raw = gip_raw_step(incidence, edge_weights, state, stress_level, node_weights=node_weights)
+    return gip_thresholds(raw, lower, upper)
+
+
+def company_activity(incidence, edge_weights, state, stress_level=0.0, *, node_weights=None):
+    """Raw return to other owners, before bounds and recipient valuation/discount.
+
+    Source population enters pressure/transmission. Its sum equals sum(raw).
+    """
+    network, weights, state, omega, stress = _step_inputs(incidence, edge_weights, state, node_weights, stress_level)
+    source, pressure, active_weights = network._pressure(weights, state, omega, stress)
     total = np.asarray(network._matrix.sum(axis=0)).reshape(-1) * pressure
-    own = np.asarray(network._squared.T @ state).reshape(-1)
+    own = np.asarray(network._squared.T @ source).reshape(-1)
     activity = active_weights * _nonnegative_difference(total, own, network._edge_operations)
     if not np.isfinite(activity).all():
         raise FloatingPointError("Non-finite company activity")
     return activity
 
 
-def gip_bounds(parameters: GIPParameters, alpha: float, step: int) -> tuple[float, float]:
-    """Bounds indexed by the next step j >= 1."""
-    # Algebraically the specified formulas, using one common growth factor to
-    # avoid inf * 0 for long decaying paths (theta_l > 1, alpha < 1).
-    growth = parameters.theta_l * alpha
-    try:
-        factor = growth ** (step - 1)
-        lower = growth * parameters.l0 * factor
-        upper = parameters.theta_h * alpha * parameters.h0 * factor
-    except OverflowError as error:
-        raise ValueError("GIP bounds overflowed") from error
-    lower = _nonnegative_scalar(lower, "lower bound")
-    upper = _nonnegative_scalar(upper, "upper bound")
-    if upper < lower:
-        raise ValueError("The upper GIP threshold cannot be below the lower threshold")
+def gip_bounds(parameters: GIPParameters, alpha: float, step: int):
+    """Original schedules at NEXT step s >= 1; scalars or node-wise arrays.
+
+    The common growth factor avoids inf*0 from separate large powers. At s=1,
+    growth**0 = 1 also when theta_l=0, so the first upper cap can be positive.
+    """
+    step = _update_count(step, "step", 1)
+    parameters.validate(alpha=alpha)
+    growth = np.asarray(parameters.theta_l) * alpha
+    factor = growth ** (step - 1)
+    with np.errstate(over="raise", invalid="raise"):
+        lower = (growth * factor) * np.asarray(parameters.l0)
+        upper = (np.asarray(parameters.theta_h) * alpha) * factor * np.asarray(parameters.u0)
     return lower, upper
 
 
-def gip(incidence: Any, edge_weights: np.ndarray, initial_state: np.ndarray,
-        parameters: GIPParameters, *, node_weights: np.ndarray | None = None,
-        stress_level: float = 0.0, alpha: float | None = 0.1,
-        max_iter: int = 999, horizon: int | None = None) -> GIPResult:
-    """Evaluate discounted GIP, including seed value exactly once.
+def seed_state(seeds, parameters: GIPParameters, *, budget: int | None = None):
+    """Initialize q0 = u0*z; validate a binary seed indicator and optional budget."""
+    seeds = np.asarray(seeds, dtype=float)
+    if seeds.ndim != 1 or not np.isfinite(seeds).all() or np.any((seeds != 0) & (seeds != 1)):
+        raise ValueError("seeds must be a finite binary vector")
+    parameters.validate(len(seeds))
+    if budget is not None and seeds.sum() != _update_count(budget, "budget", 0):
+        raise ValueError("Seed count must equal budget")
+    return _node_parameter(parameters.u0, "u0", len(seeds)) * seeds
 
-    ``horizon=T`` performs exactly T updates and scores T+1 states, including
-    T=0; eps and equality never stop it. Otherwise ``max_iter`` is the finite
-    J_max, and before update j the test is ||(1-gamma)^(j-1) x_(j-1)||_2 <= eps.
-    This numerical truncation is not a bound on omitted score. Gamma and omega
-    never enter propagation. No normalization occurs here. ``alpha=None`` keeps
-    the historical explicit option of using mean kappa (requires nonempty kappa).
+
+def gip_from_seeds(incidence, edge_weights, seeds, parameters, *, budget=None, **kwargs):
+    """Seed-indicator interface to the same evaluator used by all optimizers."""
+    return gip(incidence, edge_weights, seed_state(seeds, parameters, budget=budget), parameters, **kwargs)
+
+
+def gip(incidence, edge_weights, initial_state, parameters: GIPParameters, *,
+        node_weights=None, stress_level=0.0, alpha: float | None = 0.1,
+        max_iter: int | None = None) -> GIPResult:
+    """Approximate the infinite discounted sum until ||discount*q||_2 <= eps.
+
+    initial_state is explicitly q0=u0*z, never an independent amplitude. Prefer
+    gip_from_seeds for binary z. No fixed horizon or equal-state stopping exists.
+    max_iter is an optional operational guard; its result is incomplete. Alpha
+    defaults to the runner's fixed .1; alpha=None explicitly uses mean(kappa).
+    Neither choice rescales B. Graph reductions must supply the same graph alpha.
     """
-    parameters.validate()
-    network = prepare_incidence(incidence)
-    weights = _vector(edge_weights, "edge_weights", network.shape[1])
-    state = _vector(initial_state, "initial_state", network.shape[0]).copy()
-    objective_weights = (np.ones_like(state) if node_weights is None else
-                         _vector(node_weights, "node_weights", network.shape[0]))
-    stress = _nonnegative_scalar(stress_level, "stress_level")
-    max_iter = _update_count(max_iter, "max_iter", 1)
-    if horizon is not None:
-        horizon = _update_count(horizon, "horizon", 0)
+    network, weights, state, omega, stress = _step_inputs(incidence, edge_weights, initial_state, node_weights, stress_level)
+    state = state.copy()
     if alpha is None and not len(weights):
         raise ValueError("alpha=None requires at least one edge weight")
-    threshold_scale = _nonnegative_scalar(weights.mean() if alpha is None else alpha, "alpha")
-    gip_bounds(parameters, threshold_scale, 1)
-    discount = 1.0 - parameters.gamma
+    alpha = _nonnegative_scalar(weights.mean() if alpha is None else alpha, "alpha")
+    parameters.validate(len(state), alpha)
+    u0 = _node_parameter(parameters.u0, "u0", len(state))
+    if np.any((state != 0) & (state != u0)):
+        raise ValueError("initial_state must equal u0*z with binary z; use gip_from_seeds")
+    if max_iter is not None:
+        max_iter = _update_count(max_iter, "max_iter", 0)
+    # Validate the first cap even when the initial state already meets tolerance.
+    gip_bounds(parameters, alpha, 1)
     states = [state]
-    # Elementwise sum implements dot(omega, x), avoiding platform BLAS warnings.
-    spread_history = [float(np.sum(objective_weights * state))]
-    if not np.isfinite(spread_history[0]):
+    scores = [float(np.sum(omega * state))]
+    if not np.isfinite(scores[0]):
         raise FloatingPointError("Non-finite initial score")
-    stopping_reason = "fixed_horizon" if horizon is not None else "max_iter"
-    updates = max_iter if horizon is None else horizon
-    for step in range(1, updates + 1):
-        if horizon is None:
-            discounted_state = discount ** (step - 1) * state
-            # hypot reduction avoids overflow from squaring large finite states.
-            if np.hypot.reduce(discounted_state, initial=0.0) <= parameters.eps:
-                stopping_reason = "tolerance"
-                break
-        lower, upper = gip_bounds(parameters, threshold_scale, step)
-        state = gip_thresholds(network._raw(weights, state, stress), lower, upper)
-        score = spread_history[-1] + float(np.sum(objective_weights * state)) * discount ** step
+    active = np.flatnonzero(state > 0)
+    candidates = network.candidates(active)
+    step, discount = 0, 1.0
+    status = "tolerance_reached"
+    while np.hypot.reduce(discount * state, initial=0.0) > parameters.eps:
+        if max_iter is not None and step >= max_iter:
+            status = "operational_cutoff"
+            break
+        lower, upper = gip_bounds(parameters, alpha, step + 1)
+        raw = network._raw_frontier(weights, state, omega, stress, active, candidates)
+        next_state = np.zeros_like(state)
+        indices = np.asarray(candidates, dtype=int)
+        lower = _node_parameter(lower, "lower", len(state))
+        upper = _node_parameter(upper, "upper", len(state))
+        next_state[indices] = gip_thresholds(raw[indices], lower[indices], upper[indices])
+        # Recompute activity from scratch, retaining old actives only if supported.
+        active_next = np.flatnonzero(next_state > 0)
+        candidates_next = network.candidates(active_next)
+        discount *= 1.0 - parameters.gamma
+        score = scores[-1] + discount * float(np.sum(omega * next_state))
         if not np.isfinite(score):
             raise FloatingPointError("Non-finite discounted score")
+        state, active, candidates = next_state, active_next, candidates_next
+        step += 1
         states.append(state)
-        spread_history.append(score)
-    return GIPResult(spread_history[-1], spread_history, states,
-                     stopping_reason=stopping_reason, horizon=horizon, max_iter=max_iter)
+        scores.append(score)
+    return GIPResult(scores[-1], scores, states, status, max_iter)
 
 
 def aligned_node_weights(

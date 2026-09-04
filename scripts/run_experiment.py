@@ -8,6 +8,7 @@ network loading, per-year search, and checkpoint orchestration.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -26,14 +27,16 @@ from src.gip_model import (
     GIPParameters,
     aligned_edge_parameters,
     aligned_node_weights,
-    gip,
+    gip_from_seeds,
+    seed_state,
     prepare_incidence,
 )
+from src.model_identity import MODEL_VERSION, MODEL_METADATA, evaluation_cache_key, input_fingerprint
 from src.nads import nads
 
 DATA_DIR = PROJECT_ROOT / "data" / "processed"
 
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results" / "experiment"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results"
 DEFAULT_ALPHAS = (0.05, 0.10, 0.20)
 DEFAULT_SEED_BUDGETS = (10, 20, 40)
 DEFAULT_SEARCH_SECONDS = 800.0
@@ -56,8 +59,6 @@ PARAMETER_COLUMNS = [
     "gamma",
     "eps",
     "stress_level",
-    "seed_intensity",
-    "horizon",
     "max_iter",
     "delta",
     "xi",
@@ -68,21 +69,28 @@ PARAMETER_COLUMNS = [
     "max_search_iterations",
     "random_seed",
 ]
+IDENTITY_COLUMNS = [*MODEL_METADATA, "input_fingerprint"]
+SCORE_KEY_COLUMNS = ["start_score_key", "finish_score_key"]
+# Keep the historical public CSV columns. These two columns describe the new
+# model rather than introducing independent seed intensity or a finite horizon.
+CSV_PARAMETER_COLUMNS = PARAMETER_COLUMNS.copy()
+CSV_PARAMETER_COLUMNS[CSV_PARAMETER_COLUMNS.index("max_iter"):CSV_PARAMETER_COLUMNS.index("max_iter")] = [
+    "seed_intensity", "horizon",
+]
 RESULT_COLUMNS = [
-    "year",
-    *PARAMETER_COLUMNS,
-    "start_spread",
-    "finish_spread",
-    "start_list",
-    "finish_list",
-    "stopping_reason",
-    "diffusion_iterations",
+    "year", *CSV_PARAMETER_COLUMNS,
+    "start_spread", "finish_spread", "start_list", "finish_list",
+    "stopping_reason", "diffusion_iterations",
+]
+INTERNAL_RESULT_COLUMNS = [
+    *IDENTITY_COLUMNS, *SCORE_KEY_COLUMNS,
+    *[name for name in RESULT_COLUMNS if name not in ("seed_intensity", "horizon")],
 ]
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    """Fixed settings shared by every year in the experiment."""
+    """Scalar settings shared across years; h0 is thesis u0 and seed amplitude."""
 
     seed_budget: int = 20
     min_edge_size: int = 2
@@ -98,9 +106,7 @@ class ExperimentConfig:
     eps: float = 0.01
     alpha: float = 0.1
     stress_level: float = .0
-    seed_intensity: float = 1.0
-    horizon: int | None = 20
-    max_iter: int = 999
+    max_iter: int | None = None  # Optional operational guard, never a horizon.
     delta: float = 0.5
     xi: float = 0.01
     d: int = 2
@@ -122,23 +128,9 @@ class ExperimentConfig:
         )
 
 
-def add_horizon_arguments(parser: argparse.ArgumentParser) -> None:
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--horizon", type=int, default=ExperimentConfig.horizon,
-                      help="Exactly T updates, including T=0 (default: 20).")
-    mode.add_argument("--early-stopping", action="store_true",
-                      help="Use the discounted-state tolerance instead of a fixed horizon.")
-    parser.add_argument("--max-iter", type=int, default=ExperimentConfig.max_iter,
-                        help="Finite J_max for early stopping (default: 999).")
-
-
-def validate_horizon_arguments(parser, args) -> None:
-    if args.horizon < 0:
-        parser.error("--horizon must be non-negative")
-    if args.max_iter < 1:
-        parser.error("--max-iter must be positive")
-    if args.early_stopping:
-        args.horizon = None
+def add_stopping_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--max-iter", type=int, default=None,
+                        help="Optional operational update guard; incomplete runs cannot be ranked/saved.")
 
 
 def available_years(data_dir: Path) -> list[int]:
@@ -220,6 +212,7 @@ def load_year_model(
     structural_degree = filtered.groupby("CF Comune")["CF Partecipata"].nunique()
     ownership_weighted_degree = filtered.groupby("CF Comune")["Quota"].sum()
     return {
+        "input_fingerprint": input_fingerprint(data_dir, year),
         "incidence": incidence_matrix,
         "node_ids": node_ids,
         "edge_ids": np.asarray(matrix_edge_ids, dtype="int64"),
@@ -231,6 +224,50 @@ def load_year_model(
         "ownership_weighted_degree": ownership_weighted_degree,
         "incidence_count": len(filtered),
     }
+
+
+def result_identity(year: int, *, data_dir: Path | None = None) -> dict[str, str]:
+    return {**MODEL_METADATA, "input_fingerprint": input_fingerprint(DATA_DIR if data_dir is None else data_dir, year)}
+
+
+def seed_score_key(model, seeds, config):
+    return evaluation_cache_key(
+        model["incidence"], model["edge_weights"], seed_state(seeds, config.gip_parameters),
+        config.gip_parameters, node_weights=model["node_weights"],
+        stress_level=config.stress_level, alpha=config.alpha, max_iter=config.max_iter,
+    )
+
+
+def config_from_row(row) -> ExperimentConfig:
+    values = {name: row[name] for name in PARAMETER_COLUMNS}
+    values["search_seconds_per_year"] = values.pop("search_seconds")
+    for name in ("seed_budget", "min_edge_size", "d", "max_neighbors_per_phase", "buffer_dim",
+                 "max_search_iterations", "random_seed"):
+        values[name] = int(values[name])
+    values["max_iter"] = None if pd.isna(values["max_iter"]) else int(values["max_iter"])
+    return ExperimentConfig(**values)
+
+
+def validate_saved_seeds(row, model, config):
+    """Validate stored seeds and full evaluation keys before reuse/reconstruction."""
+    for column, expected in MODEL_METADATA.items():
+        if row[column] != expected:
+            raise ValueError(f"Incompatible saved model: {column}")
+    if row["stopping_reason"] != "tolerance_reached":
+        raise ValueError("Incomplete saved evaluation cannot be ranked")
+    if row["input_fingerprint"] != model["input_fingerprint"]:
+        raise ValueError("Saved input fingerprint does not match current data; preserve the old result")
+    output = {}
+    for label in ("start", "finish"):
+        ids = row[f"{label}_list"]
+        ids = json.loads(ids) if isinstance(ids, str) else list(ids)
+        if len(set(ids)) != len(ids) or len(ids) != config.seed_budget or set(ids) - set(model["node_ids"]):
+            raise ValueError("Saved seeds do not match the network/budget")
+        seeds = np.isin(model["node_ids"], ids).astype(float)
+        if seed_score_key(model, seeds, config) != row[f"{label}_score_key"]:
+            raise ValueError("Saved score key does not match seeds/network/parameters; preserve the old result")
+        output[label] = seeds
+    return output
 
 
 def run_year(
@@ -259,21 +296,23 @@ def run_year(
         config.seed_budget,
     )
 
+    config.gip_parameters.validate(len(node_ids), config.alpha)
+    if config.seed_budget < 1:
+        raise ValueError("seed_budget must be positive")
     objective_calls = 0
 
     def simulate(seed_indicator: np.ndarray) -> float:
-        result = gip(
+        result = gip_from_seeds(
             incidence_matrix,
             edge_weights,
-            seed_indicator * config.seed_intensity,
+            seed_indicator,
             config.gip_parameters,
             node_weights=node_weights,
             stress_level=config.stress_level,
             alpha=config.alpha,
-            horizon=config.horizon,
             max_iter=config.max_iter,
         )
-        return result.total_spread
+        return result.require_complete().total_spread
 
     def search_objective(seed_indicator: np.ndarray) -> float:
         nonlocal objective_calls
@@ -303,6 +342,7 @@ def run_year(
             buffer_dim=config.buffer_dim,
             max_neighbors_per_phase=config.max_neighbors_per_phase,
             max_iterations=config.max_search_iterations,
+            neighbor_graph=incidence_matrix,
             random_seed=config.random_seed + search_restarts,
             verbose=int(verbose),
         )
@@ -377,21 +417,25 @@ def run_year(
         kind="stable",
     )
 
-    best_result = gip(
+    best_result = gip_from_seeds(
         incidence_matrix,
         edge_weights,
-        best_seeds * config.seed_intensity,
+        best_seeds,
         config.gip_parameters,
         node_weights=node_weights,
         stress_level=config.stress_level,
         alpha=config.alpha,
-        horizon=config.horizon,
         max_iter=config.max_iter,
     )
+    best_result.require_complete()
     summary: dict[str, object] = {
+        **MODEL_METADATA,
+        "input_fingerprint": model["input_fingerprint"],
+        "start_score_key": seed_score_key(model, initial_seeds, config),
+        "finish_score_key": seed_score_key(model, best_seeds, config),
         **asdict(config),
         "stopping_reason": best_result.stopping_reason,
-        "evaluation_mode": "fixed" if config.horizon is not None else "early",
+        "evaluation_mode": "infinite_discounted_tolerance",
         "year": int(year),
         "nodes": incidence_matrix.shape[0],
         "hyperedges": incidence_matrix.shape[1],
@@ -404,7 +448,8 @@ def run_year(
         "best_spread": float(best_spread_history[-1]),
         "relative_improvement_pct": float(
             100.0
-            * (best_spread_history[-1] / best_spread_history[0] - 1.0)
+            * ((best_spread_history[-1] / best_spread_history[0] - 1.0)
+            if best_spread_history[0] else 0.0)
         ),
         "accepted_seed_sets": len(best_seed_history),
         "accepted_seed_sets_all_restarts": accepted_seed_sets_all_restarts,
@@ -464,11 +509,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show live NaDS objective evaluations.",
     )
-    add_horizon_arguments(parser)
+    add_stopping_arguments(parser)
     args = parser.parse_args()
-    validate_horizon_arguments(parser, args)
-    if any(not np.isfinite(alpha) or alpha <= 0 for alpha in args.alphas):
-        parser.error("Every --alphas value must be positive")
+    if args.max_iter is not None and args.max_iter < 0:
+        parser.error("--max-iter must be non-negative")
+    if any(not np.isfinite(alpha) or alpha < 0 or ExperimentConfig.theta_l * alpha >= 1 for alpha in args.alphas):
+        parser.error("Every --alphas value must be non-negative with theta_l * alpha < 1")
     if any(budget <= 0 for budget in args.seed_budgets):
         parser.error("Every --seed-budgets value must be positive")
     if not np.isfinite(args.search_seconds) or args.search_seconds <= 0:
@@ -496,35 +542,90 @@ def instance_mask(
             mask &= results[column].isna()
         else:
             mask &= pd.to_numeric(results[column], errors="coerce").eq(instance[column])
+    for column in IDENTITY_COLUMNS:
+        mask &= results[column].eq(instance[column])
+    mask &= results["stopping_reason"].eq("tolerance_reached")
     return mask
 
 
-def load_results(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame(columns=RESULT_COLUMNS)
-    results = pd.read_csv(path, float_precision="round_trip")
-    missing = [column for column in RESULT_COLUMNS if column not in results.columns]
+def result_metadata_path(path: Path) -> Path:
+    return path.with_name(f".{path.stem}.metadata.json")
+
+
+def _validate_result_metadata(results: pd.DataFrame, path: Path) -> None:
+    missing = [column for column in INTERNAL_RESULT_COLUMNS if column not in results.columns]
     if missing:
-        raise ValueError(
-            f"{path} has an incompatible result format; missing {missing}. "
-            "Use a results file generated by the current experiment runner."
-        )
+        raise ValueError(f"{path} has an incompatible result format; missing {missing}")
+    for column, expected in MODEL_METADATA.items():
+        if not results[column].eq(expected).all():
+            raise ValueError(f"{path} has incompatible model metadata ({column}); preserve the historical file")
+    if not results["stopping_reason"].eq("tolerance_reached").all():
+        raise ValueError("Incomplete evaluations cannot be loaded/saved as completed results")
+    if results[IDENTITY_COLUMNS + SCORE_KEY_COLUMNS].isna().any().any():
+        raise ValueError("Missing result identity or score keys")
+
+
+def load_results(path: Path) -> pd.DataFrame:
+    """Read the familiar CSV, restoring internal identities from its hidden sidecar.
+
+    Rich CSVs from the first v2 runner remain readable for lossless migration.
+    Historical plain CSVs without model provenance are never silently relabelled.
+    """
+    if not path.exists():
+        return pd.DataFrame(columns=INTERNAL_RESULT_COLUMNS)
+    results = pd.read_csv(path, float_precision="round_trip")
+    if not all(name in results.columns for name in IDENTITY_COLUMNS + SCORE_KEY_COLUMNS):
+        metadata_path = result_metadata_path(path)
+        if not metadata_path.exists():
+            raise ValueError(f"{path} is incompatible: missing current-model metadata sidecar")
+        metadata = json.loads(metadata_path.read_text())
+        if metadata.get("csv_sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
+            raise ValueError("CSV and metadata checksum differ; do not reuse stale or edited scores")
+        records = metadata.get("rows", [])
+        if metadata.get("format_version") != 1 or len(records) != len(results):
+            raise ValueError("Incompatible result metadata format or row count")
+        if any(name not in results.columns for name in RESULT_COLUMNS):
+            raise ValueError("Incompatible public result columns")
+        for name in IDENTITY_COLUMNS + SCORE_KEY_COLUMNS:
+            results[name] = [record[name] for record in records]
+        if results["horizon"].notna().any() or not results["seed_intensity"].eq(results["h0"]).all():
+            raise ValueError("Current results require blank horizon and seed_intensity equal to h0=u0")
+    _validate_result_metadata(results, path)
     return results
 
 
 def save_results(path: Path, results: pd.DataFrame) -> None:
-    ordered = results.sort_values(
-        ["year", "alpha", "seed_budget"], kind="stable"
-    )
+    """Save the original CSV layout; keep provenance in .results.metadata.json."""
+    if path.exists():
+        load_results(path)  # Refuse to overwrite an unversioned historical checkpoint.
+    _validate_result_metadata(results, path)
+    ordered = results.sort_values(["year", "alpha", "seed_budget"], kind="stable").copy()
+    ordered["seed_intensity"] = ordered["h0"]  # Derived alias, not a separate parameter.
+    ordered["horizon"] = None                  # Infinite objective, never a fixed horizon.
+    public = ordered.drop(columns=IDENTITY_COLUMNS + SCORE_KEY_COLUMNS)
+    extra_columns = [name for name in public.columns if name not in RESULT_COLUMNS]
+    public = public[[*RESULT_COLUMNS, *extra_columns]]
     temporary_path = path.with_name(f".{path.name}.tmp")
-    ordered.to_csv(temporary_path, index=False)
+    public.to_csv(temporary_path, index=False)
+    metadata = {
+        "format_version": 1,
+        "csv_sha256": hashlib.sha256(temporary_path.read_bytes()).hexdigest(),
+        "rows": ordered[IDENTITY_COLUMNS + SCORE_KEY_COLUMNS].to_dict(orient="records"),
+    }
+    metadata_path = result_metadata_path(path)
+    temporary_metadata = metadata_path.with_suffix(".tmp")
+    temporary_metadata.write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
+    # If interrupted between replacements, the digest fails closed on the next load.
     temporary_path.replace(path)
+    temporary_metadata.replace(metadata_path)
 
 
 def upsert_result(
     results: pd.DataFrame,
     row: dict[str, object],
 ) -> pd.DataFrame:
+    if row["stopping_reason"] != "tolerance_reached":
+        raise ValueError("Incomplete evaluations cannot be checkpointed/ranked")
     if instance_mask(results, row).any():
         return results  # Preserve the original completed result.
     return pd.concat([results, pd.DataFrame([row])], ignore_index=True)
@@ -569,7 +670,6 @@ def main() -> None:
     for number, (year, alpha, seed_budget) in enumerate(run_specs, start=1):
         config = ExperimentConfig(
             seed_budget=seed_budget,
-            horizon=args.horizon,
             max_iter=args.max_iter,
             edge_weight_beta=EDGE_WEIGHT_BETA,
             node_weight_beta=NODE_WEIGHT_BETA,
@@ -578,17 +678,23 @@ def main() -> None:
         )
         parameters = parameter_values(config)
         instance: dict[str, object] = {
-            "year": year, **parameters,
+            "year": year, **parameters, **result_identity(year),
         }
         label = progress_parameters(year, config)
         if instance_mask(results, instance).any():
+            model = load_year_model(year, config)
+            for _, saved in results.loc[instance_mask(results, instance)].iterrows():
+                validate_saved_seeds(saved, model, config)
             print(f"[{number}/{total}] already saved: {label}")
             continue
 
         print(f"[{number}/{total}] {label}")
         summary, _, _ = run_year(year, config, verbose=args.verbose)
+        if summary["input_fingerprint"] != instance["input_fingerprint"]:
+            raise ValueError("Input files changed during evaluation; no checkpoint saved")
         row: dict[str, object] = {
             **instance,
+            **{key: summary[key] for key in SCORE_KEY_COLUMNS},
             **{key: summary[key] for key in ("stopping_reason", "diffusion_iterations")},
             "start_spread": float(summary["initial_spread"]),
             "finish_spread": float(summary["best_spread"]),
