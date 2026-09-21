@@ -61,6 +61,8 @@ The required inputs are:
 - `data/raw/popolazione.csv`, whose `BDAP` column is the `Id_Ente` key and whose
   other columns are annual populations.
 
+The raw files are not versioned; place them in `data/raw/` before running.
+
 ```bash
 python src/prepare_data.py
 ```
