@@ -1,0 +1,10 @@
+geopandas
+hypernetx
+igraph
+matplotlib
+networkx
+numpy
+openpyxl
+pandas
+jupyter
+scipy
